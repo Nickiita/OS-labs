@@ -7,383 +7,271 @@
 #endif
 
 #include "platform.h"
-
-#include <inttypes.h>
 #include <stdlib.h>
 
-static SharedState shared;
+int64_t *counter;
+FILE *log_file;
 static void (*thread_function)(void);
 
-static void fail(const char *operation) {
-    fprintf(stderr, "lab3: %s failed\n", operation);
+// Bytes 0..7 contain the counter. The other offsets identify locks.
+enum { DATA = sizeof(int64_t), LEADER, LIVE };
+
+static void fail(const char *message) {
+    fprintf(stderr, "%s failed\n", message);
     exit(EXIT_FAILURE);
 }
 
 #ifdef _WIN32
-
-#include <io.h>
 #include <process.h>
 #include <share.h>
-#include <wchar.h>
 
-static HANDLE mapping;
-static HANDLE shared_mutex;
-static HANDLE leader_mutex;
-static HANDLE timer_thread;
+static HANDLE state, mapping, thread;
+static CRITICAL_SECTION local_mutex;
 
-SharedState platform_open(void) {
-    shared.log = _fsopen("lab3.log", "a+b", _SH_DENYNO);
-    if (shared.log == NULL) {
-        fail("opening lab3.log");
-    }
-
-    BY_HANDLE_FILE_INFORMATION info;
-    HANDLE log_handle = (HANDLE)_get_osfhandle(_fileno(shared.log));
-    if (!GetFileInformationByHandle(log_handle, &info)) {
-        fail("identifying lab3.log");
-    }
-
-    // Имя IPC-объекта одинаково у всех, кто открыл один и тот же лог.
-    char name[96];
-    int length = snprintf(name, sizeof(name), "Local\\lab3-%08lx-%08lx%08lx-",
-                          (unsigned long)info.dwVolumeSerialNumber,
-                          (unsigned long)info.nFileIndexHigh,
-                          (unsigned long)info.nFileIndexLow);
-    char *suffix = name + length;
-    size_t available = sizeof(name) - (size_t)length;
-
-    snprintf(suffix, available, "counter");
-    mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
-                                 0, sizeof(*shared.counter), name);
-    if (mapping == NULL) {
-        fail("creating shared memory");
-    }
-    shared.counter = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, sizeof(*shared.counter));
-    if (shared.counter == NULL) {
-        fail("mapping shared memory");
-    }
-
-    snprintf(suffix, available, "data");
-    shared_mutex = CreateMutexA(NULL, FALSE, name);
-    snprintf(suffix, available, "leader");
-    leader_mutex = CreateMutexA(NULL, FALSE, name);
-    if (shared_mutex == NULL || leader_mutex == NULL) {
-        fail("creating mutexes");
-    }
-    return shared;
+static bool lock(int byte, bool wait, bool exclusive) {
+    OVERLAPPED pos = {0};
+    pos.Offset = byte;
+    DWORD flags = (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0) |
+                  (wait ? 0 : LOCKFILE_FAIL_IMMEDIATELY);
+    if (LockFileEx(state, flags, 0, 1, 0, &pos)) return true;
+    if (!wait && GetLastError() == ERROR_LOCK_VIOLATION) return false;
+    fail("LockFileEx");
+    return false;
 }
 
-void platform_close(void) {
-    UnmapViewOfFile(shared.counter);
+static void unlock(int byte) {
+    OVERLAPPED pos = {0};
+    pos.Offset = byte;
+    if (!UnlockFileEx(state, 0, 1, 0, &pos)) fail("UnlockFileEx");
+}
+
+static void open_state(void) {
+    state = CreateFileW(L"lab3.state", GENERIC_READ | GENERIC_WRITE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (state == INVALID_HANDLE_VALUE) fail("CreateFile");
+    lock(DATA, true, true);
+    mapping = CreateFileMappingW(state, NULL, PAGE_READWRITE, 0, sizeof(*counter), NULL);
+    if (!mapping) fail("CreateFileMapping");
+    counter = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, sizeof(*counter));
+    if (!counter) fail("MapViewOfFile");
+    log_file = _fsopen("lab3.log", "ab", _SH_DENYNO);
+    InitializeCriticalSection(&local_mutex);
+}
+
+static void close_state(void) {
+    DeleteCriticalSection(&local_mutex);
+    UnmapViewOfFile(counter);
     CloseHandle(mapping);
-    CloseHandle(shared_mutex);
-    CloseHandle(leader_mutex);
-    fclose(shared.log);
+    CloseHandle(state);
 }
 
 void platform_lock(void) {
-    DWORD result = WaitForSingleObject(shared_mutex, INFINITE);
-    if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
-        fail("locking shared data");
-    }
+    EnterCriticalSection(&local_mutex);
+    lock(DATA, true, true);
 }
 
 void platform_unlock(void) {
-    if (!ReleaseMutex(shared_mutex)) {
-        fail("unlocking shared data");
-    }
+    unlock(DATA);
+    LeaveCriticalSection(&local_mutex);
 }
 
-bool platform_try_leader(void) {
-    DWORD result = WaitForSingleObject(leader_mutex, 0);
-    if (result == WAIT_TIMEOUT) {
-        return false;
-    }
-    if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
-        fail("acquiring leadership");
-    }
-    return true;
-}
-
-void platform_release_leader(void) {
-    if (!ReleaseMutex(leader_mutex)) {
-        fail("releasing leadership");
-    }
-}
-
-Process platform_spawn(char *program, int copy_number) {
+Process spawn(char *program, int number) {
     (void)program;
-    wchar_t executable[32768];
-    DWORD length = GetModuleFileNameW(NULL, executable, 32768);
-    if (length == 0 || length >= 32768) {
-        return NO_PROCESS;
-    }
-
-    wchar_t child1_command[] = L"lab3 --child1";
-    wchar_t child2_command[] = L"lab3 --child2";
-    wchar_t *command = copy_number == 1 ? child1_command : child2_command;
-
+    wchar_t path[32768];
+    wchar_t child1[] = L"lab3 --child1", child2[] = L"lab3 --child2";
+    wchar_t *command = number == 1 ? child1 : child2;
+    DWORD length = GetModuleFileNameW(NULL, path, 32768);
+    if (!length || length >= 32768) return 0;
     STARTUPINFOW startup = {0};
-    PROCESS_INFORMATION process;
+    PROCESS_INFORMATION child;
     startup.cb = sizeof(startup);
-    if (!CreateProcessW(executable, command, NULL, NULL, FALSE, 0,
-                        NULL, NULL, &startup, &process)) {
-        return NO_PROCESS;
-    }
-    CloseHandle(process.hThread);
-    return process.hProcess;
+    if (!CreateProcessW(path, command, NULL, NULL, FALSE, 0,
+                        NULL, NULL, &startup, &child)) return 0;
+    CloseHandle(child.hThread);
+    return child.hProcess;
 }
 
-bool platform_reap_copy(Process *copy, bool wait) {
-    if (*copy == NO_PROCESS) {
-        return true;
-    }
-    DWORD result = WaitForSingleObject(*copy, wait ? INFINITE : 0);
-    if (result == WAIT_TIMEOUT) {
-        return false;
-    }
-    if (result != WAIT_OBJECT_0) {
-        fail("waiting for a copy");
-    }
-    CloseHandle(*copy);
-    *copy = NO_PROCESS;
+bool reap(Process *child, bool wait) {
+    if (!*child) return true;
+    DWORD result = WaitForSingleObject(*child, wait ? INFINITE : 0);
+    if (result == WAIT_TIMEOUT) return false;
+    if (result != WAIT_OBJECT_0) fail("WaitForSingleObject");
+    CloseHandle(*child);
+    *child = 0;
     return true;
 }
 
-static unsigned __stdcall thread_main(void *argument) {
-    (void)argument;
+static unsigned __stdcall thread_main(void *arg) {
+    (void)arg;
     thread_function();
     return 0;
 }
 
-void platform_start_thread(void (*function)(void)) {
+void start_thread(void (*function)(void)) {
     thread_function = function;
-    timer_thread = (HANDLE)_beginthreadex(NULL, 0, thread_main, NULL, 0, NULL);
-    if (timer_thread == NULL) {
-        fail("starting timer thread");
-    }
+    thread = (HANDLE)_beginthreadex(NULL, 0, thread_main, NULL, 0, NULL);
+    if (!thread) fail("_beginthreadex");
 }
 
-void platform_join_thread(void) {
-    if (WaitForSingleObject(timer_thread, INFINITE) != WAIT_OBJECT_0) {
-        fail("waiting for timer thread");
-    }
-    CloseHandle(timer_thread);
+void join_thread(void) {
+    if (WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0) fail("joining thread");
+    CloseHandle(thread);
 }
 
-uint64_t platform_monotonic_ms(void) {
-    return GetTickCount64();
-}
+uint64_t monotonic_ms(void) { return GetTickCount64(); }
+void sleep_ms(unsigned ms) { Sleep(ms); }
+unsigned long process_id(void) { return GetCurrentProcessId(); }
 
-void platform_sleep_ms(unsigned milliseconds) {
-    Sleep(milliseconds);
-}
-
-void platform_timestamp(char result[TIMESTAMP_SIZE]) {
-    SYSTEMTIME time;
-    GetLocalTime(&time);
-    snprintf(result, TIMESTAMP_SIZE, "%04u-%02u-%02u %02u:%02u:%02u.%03u",
-             (unsigned)time.wYear, (unsigned)time.wMonth, (unsigned)time.wDay,
-             (unsigned)time.wHour, (unsigned)time.wMinute, (unsigned)time.wSecond,
-             (unsigned)time.wMilliseconds);
-}
-
-uint64_t platform_pid(void) {
-    return GetCurrentProcessId();
+void timestamp(char result[32]) {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    snprintf(result, 32, "%04u-%02u-%02u %02u:%02u:%02u.%03u",
+             (unsigned)t.wYear, (unsigned)t.wMonth, (unsigned)t.wDay,
+             (unsigned)t.wHour, (unsigned)t.wMinute, (unsigned)t.wSecond,
+             (unsigned)t.wMilliseconds);
 }
 
 #else
-
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <spawn.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 extern char **environ;
-
-// Три независимые блокировки на байтах открытого файла лога.
-enum { DATA_BYTE, LEADER_BYTE, LIVE_BYTE };
-
-static int log_fd;
-static char shm_name[32];
+static int state;
+static pthread_t thread;
 static pthread_mutex_t local_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t timer_thread;
 
-static bool file_lock(off_t byte, short type, int command) {
-    struct flock lock = {
-        .l_type = type,
-        .l_whence = SEEK_SET,
-        .l_start = byte,
-        .l_len = 1
-    };
+static bool lock(int byte, bool wait, bool exclusive) {
+    struct flock f = {0};
+    f.l_type = exclusive ? F_WRLCK : F_RDLCK;
+    f.l_whence = SEEK_SET;
+    f.l_start = byte;
+    f.l_len = 1;
     int result;
-    do {
-        result = fcntl(log_fd, command, &lock);
-    } while (result == -1 && errno == EINTR);
+    do { result = fcntl(state, wait ? F_SETLKW : F_SETLK, &f); }
+    while (result == -1 && errno == EINTR);
+    if (result == 0) return true;
+    if (!wait && (errno == EACCES || errno == EAGAIN)) return false;
+    fail("fcntl lock");
+    return false;
+}
 
-    if (result == -1) {
-        if (command == F_SETLK && type == F_WRLCK && (errno == EACCES || errno == EAGAIN)) {
-            return false;
-        }
-        fail("locking lab3.log");
-    }
-    return command != F_GETLK || lock.l_type != F_UNLCK;
+static void unlock(int byte) {
+    struct flock f = {0};
+    f.l_type = F_UNLCK;
+    f.l_whence = SEEK_SET;
+    f.l_start = byte;
+    f.l_len = 1;
+    if (fcntl(state, F_SETLK, &f) == -1) fail("fcntl unlock");
+}
+
+static void open_state(void) {
+    state = open("lab3.state", O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (state == -1) fail("open lab3.state");
+    lock(DATA, true, true);
+    if (ftruncate(state, sizeof(*counter)) == -1) fail("ftruncate");
+    counter = mmap(NULL, sizeof(*counter), PROT_READ | PROT_WRITE, MAP_SHARED, state, 0);
+    if (counter == MAP_FAILED) fail("mmap");
+    log_file = fopen("lab3.log", "a");
+    if (log_file && fcntl(fileno(log_file), F_SETFD, FD_CLOEXEC) == -1)
+        fail("fcntl FD_CLOEXEC");
+}
+
+static void close_state(void) {
+    munmap(counter, sizeof(*counter));
+    close(state);
+    pthread_mutex_destroy(&local_mutex);
 }
 
 void platform_lock(void) {
-    // fcntl различает процессы, pthread_mutex различает потоки одного процесса.
-    if (pthread_mutex_lock(&local_mutex) != 0) {
-        fail("locking local mutex");
-    }
-    file_lock(DATA_BYTE, F_WRLCK, F_SETLKW);
+    if (pthread_mutex_lock(&local_mutex) != 0) fail("pthread_mutex_lock");
+    lock(DATA, true, true);
 }
 
 void platform_unlock(void) {
-    file_lock(DATA_BYTE, F_UNLCK, F_SETLK);
-    if (pthread_mutex_unlock(&local_mutex) != 0) {
-        fail("unlocking local mutex");
-    }
+    unlock(DATA);
+    if (pthread_mutex_unlock(&local_mutex) != 0) fail("pthread_mutex_unlock");
 }
 
-SharedState platform_open(void) {
-    // Для F_RDLCK на LIVE_BYTE нужен дескриптор, открытый также на чтение.
-    shared.log = fopen("lab3.log", "a+");
-    if (shared.log == NULL) {
-        fail("opening lab3.log");
-    }
-    log_fd = fileno(shared.log);
-    struct stat info;
-    if (fcntl(log_fd, F_SETFD, FD_CLOEXEC) == -1 || fstat(log_fd, &info) == -1) {
-        fail("identifying lab3.log");
-    }
-    uint64_t key = ((uint64_t)info.st_dev * UINT64_C(11400714819323198485)) ^ (uint64_t)info.st_ino;
-    snprintf(shm_name, sizeof(shm_name), "/lab3-%016" PRIx64, key);
-
-    platform_lock();
-    bool first = !file_lock(LIVE_BYTE, F_WRLCK, F_GETLK);
-    if (first && shm_unlink(shm_name) == -1 && errno != ENOENT) {
-        fail("removing old shared memory");
-    }
-    int fd = shm_open(shm_name, first ? O_RDWR | O_CREAT | O_EXCL : O_RDWR, 0600);
-    if (fd == -1 || (first && ftruncate(fd, sizeof(*shared.counter)) == -1)) {
-        fail("opening shared memory");
-    }
-    shared.counter = mmap(NULL, sizeof(*shared.counter), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (shared.counter == MAP_FAILED) {
-        fail("mapping shared memory");
-    }
-    file_lock(LIVE_BYTE, F_RDLCK, F_SETLK);
-    platform_unlock();
-    return shared;
+Process spawn(char *program, int number) {
+    char *args[] = {program, number == 1 ? "--child1" : "--child2", NULL};
+    Process child;
+    return posix_spawnp(&child, program, NULL, NULL, args, environ) == 0 ? child : 0;
 }
 
-void platform_close(void) {
-    platform_lock();
-    file_lock(LIVE_BYTE, F_UNLCK, F_SETLK);
-    if (!file_lock(LIVE_BYTE, F_WRLCK, F_GETLK) && shm_unlink(shm_name) == -1) {
-        fail("removing shared memory");
-    }
-    platform_unlock();
-
-    munmap(shared.counter, sizeof(*shared.counter));
-    fclose(shared.log);
-}
-
-bool platform_try_leader(void) {
-    return file_lock(LEADER_BYTE, F_WRLCK, F_SETLK);
-}
-
-void platform_release_leader(void) {
-    file_lock(LEADER_BYTE, F_UNLCK, F_SETLK);
-}
-
-Process platform_spawn(char *program, int copy_number) {
-    char *args[] = {program, copy_number == 1 ? "--child1" : "--child2", NULL};
-    Process process;
-    if (posix_spawnp(&process, program, NULL, NULL, args, environ) != 0) {
-        return NO_PROCESS;
-    }
-    return process;
-}
-
-bool platform_reap_copy(Process *copy, bool wait) {
-    if (*copy == NO_PROCESS) {
-        return true;
-    }
-    Process result;
-    do {
-        result = waitpid(*copy, NULL, wait ? 0 : WNOHANG);
-    } while (result == -1 && errno == EINTR);
-    if (result == -1) {
-        fail("waiting for a copy");
-    }
-    if (result == 0) {
-        return false;
-    }
-    *copy = NO_PROCESS;
+bool reap(Process *child, bool wait) {
+    if (!*child) return true;
+    pid_t result;
+    do { result = waitpid(*child, NULL, wait ? 0 : WNOHANG); }
+    while (result == -1 && errno == EINTR);
+    if (result == -1) fail("waitpid");
+    if (result == 0) return false;
+    *child = 0;
     return true;
 }
 
-static void *thread_main(void *argument) {
-    (void)argument;
+static void *thread_main(void *arg) {
+    (void)arg;
     thread_function();
     return NULL;
 }
 
-void platform_start_thread(void (*function)(void)) {
+void start_thread(void (*function)(void)) {
     thread_function = function;
-    if (pthread_create(&timer_thread, NULL, thread_main, NULL) != 0) {
-        fail("starting timer thread");
-    }
+    if (pthread_create(&thread, NULL, thread_main, NULL) != 0) fail("pthread_create");
 }
 
-void platform_join_thread(void) {
-    if (pthread_join(timer_thread, NULL) != 0) {
-        fail("waiting for timer thread");
-    }
+void join_thread(void) {
+    if (pthread_join(thread, NULL) != 0) fail("pthread_join");
 }
 
-uint64_t platform_monotonic_ms(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
-        fail("reading monotonic time");
-    }
-    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+uint64_t monotonic_ms(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) == -1) fail("clock_gettime");
+    return (uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
-void platform_sleep_ms(unsigned milliseconds) {
-    struct timespec interval = {
-        .tv_sec = milliseconds / 1000,
-        .tv_nsec = (long)(milliseconds % 1000) * 1000000
-    };
-    while (nanosleep(&interval, &interval) == -1) {
-        if (errno != EINTR) {
-            fail("waiting on timer");
-        }
-    }
+void sleep_ms(unsigned ms) {
+    struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
+    while (nanosleep(&t, &t) == -1)
+        if (errno != EINTR) fail("nanosleep");
 }
 
-void platform_timestamp(char result[TIMESTAMP_SIZE]) {
-    struct timespec now;
+unsigned long process_id(void) { return (unsigned long)getpid(); }
+
+void timestamp(char result[32]) {
+    struct timespec t;
     struct tm local;
-    if (clock_gettime(CLOCK_REALTIME, &now) == -1 || localtime_r(&now.tv_sec, &local) == NULL) {
-        fail("reading local time");
-    }
-    size_t length = strftime(result, TIMESTAMP_SIZE, "%Y-%m-%d %H:%M:%S", &local);
-    if (length == 0) {
-        fail("formatting local time");
-    }
-    snprintf(result + length, TIMESTAMP_SIZE - length, ".%03d", (int)(now.tv_nsec / 1000000));
+    if (clock_gettime(CLOCK_REALTIME, &t) == -1 || !localtime_r(&t.tv_sec, &local))
+        fail("local time");
+    size_t n = strftime(result, 32, "%Y-%m-%d %H:%M:%S", &local);
+    if (!n) fail("strftime");
+    snprintf(result + n, 32 - n, ".%03d", (int)(t.tv_nsec / 1000000));
 }
-
-uint64_t platform_pid(void) {
-    return (uint64_t)getpid();
-}
-
 #endif
+
+void platform_open(void) {
+    open_state(); // DATA is locked until initialization is complete.
+    if (!log_file) fail("open lab3.log");
+    if (lock(LIVE, false, true)) {
+        *counter = 0; // No other instances are using the counter.
+        unlock(LIVE);
+    }
+    lock(LIVE, true, false);
+    unlock(DATA);
+}
+
+void platform_close(void) {
+    fclose(log_file);
+    unlock(LIVE);
+    close_state();
+}
+
+bool try_leader(void) { return lock(LEADER, false, true); }
+void release_leader(void) { unlock(LEADER); }
